@@ -48,7 +48,9 @@ import (
 	"github.com/prometheus-operator/prometheus-operator/pkg/alertmanager"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	prompkg "github.com/prometheus-operator/prometheus-operator/pkg/prometheus"
 	prometheus "github.com/prometheus-operator/prometheus-operator/pkg/prometheus/server"
+	operatorFramework "github.com/prometheus-operator/prometheus-operator/test/framework"
 	testFramework "github.com/prometheus-operator/prometheus-operator/test/framework"
 )
 
@@ -5047,6 +5049,76 @@ func testPrometheusStatusScale(t *testing.T) {
 	}
 }
 
+func testPrometheusRetentionPolicies(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	testCtx := framework.NewTestCtx(t)
+	defer testCtx.Cleanup(t)
+
+	ns := framework.CreateNamespace(ctx, t, testCtx)
+	framework.SetupPrometheusRBAC(ctx, t, testCtx, ns)
+	_, err := framework.CreateOrUpdatePrometheusOperatorWithOpts(
+		ctx, operatorFramework.PrometheusOperatorOpts{
+			Namespace:           ns,
+			AllowedNamespaces:   []string{ns},
+			EnabledFeatureGates: []string{"ShardRetentionPolicies"},
+		},
+	)
+	require.NoError(t, err)
+
+	testCases := []struct {
+		name                 string
+		whenScale            monitoringv1.WhenScaledDownRetentionType
+		expectedRemainingSts int
+	}{
+		{
+			name:                 "delete",
+			whenScale:            monitoringv1.WhenScaledDownRetentionTypeDelete,
+			expectedRemainingSts: 1,
+		},
+		{
+			name:                 "retain",
+			whenScale:            monitoringv1.WhenScaledDownRetentionTypeRetain,
+			expectedRemainingSts: 2,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := framework.MakeBasicPrometheus(ns, tc.name, tc.name, 1)
+			p.Spec.ShardRetentionPolicy = &monitoringv1.ShardRetentionPolicy{
+				WhenScaledDown: tc.whenScale,
+			}
+			p.Spec.Shards = ptr.To(int32(2))
+			_, err := framework.CreatePrometheusAndWaitUntilReady(ctx, ns, p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err = framework.ScalePrometheusAndWaitUntilReady(ctx, tc.name, ns, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if p.Status.Shards != 1 {
+				t.Fatalf("expected scale of 1 shard, got %d", p.Status.Shards)
+			}
+			// Not only status should be updated, but also number of statefulsets also needs to be checked.
+			selectorLabels := makeSelectorLabels(p.Name)
+			selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectorLabels})
+			if err != nil {
+				t.Fatalf("failed to create selector for prometheus scale status: %v", err)
+			}
+			stsList, err := framework.KubeClient.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{LabelSelector: selector.String()})
+			if err != nil {
+				t.Fatalf("failed to list statefulsets: %v", err)
+			}
+			if len(stsList.Items) != tc.expectedRemainingSts {
+				t.Fatalf("expected %d statefulset remaining, got %d", tc.expectedRemainingSts, len(stsList.Items))
+			}
+		})
+	}
+}
+
 func isAlertmanagerDiscoveryWorking(ns, promSVCName, alertmanagerName string) func(ctx context.Context) (bool, error) {
 	return func(ctx context.Context) (bool, error) {
 		pods, err := framework.KubeClient.CoreV1().Pods(ns).List(ctx, alertmanager.ListOptions(alertmanagerName))
@@ -5110,4 +5182,14 @@ type alertmanagerDiscovery struct {
 type prometheusAlertmanagerAPIResponse struct {
 	Status string                 `json:"status"`
 	Data   *alertmanagerDiscovery `json:"data"`
+}
+
+func makeSelectorLabels(name string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/managed-by":  "prometheus-operator",
+		"app.kubernetes.io/name":        "prometheus",
+		"app.kubernetes.io/instance":    name,
+		prompkg.PrometheusNameLabelName: name,
+		"prometheus":                    name,
+	}
 }
